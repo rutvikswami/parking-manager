@@ -1,0 +1,288 @@
+-- =============================================
+-- EXTENSIONS
+-- =============================================
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- =============================================
+-- MAIN TABLES
+-- =============================================
+
+CREATE TABLE IF NOT EXISTS parking_locations (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    address TEXT NOT NULL,
+    lat DECIMAL(10, 8) NOT NULL,
+    lng DECIMAL(11, 8) NOT NULL,
+    owner_user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+    total_zones INTEGER DEFAULT 0,
+    description TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS parking_zones (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    location_id UUID REFERENCES parking_locations(id) ON DELETE CASCADE NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    zone_number INTEGER NOT NULL,
+    lat DECIMAL(10, 8) NOT NULL,
+    lng DECIMAL(11, 8) NOT NULL,
+    total_slots INTEGER NOT NULL DEFAULT 1,
+    available_slots INTEGER NOT NULL DEFAULT 1,
+    is_full BOOLEAN DEFAULT FALSE,
+    status VARCHAR(20) CHECK (status IN ('available', 'full', 'maintenance')) DEFAULT 'available',
+    cost_per_hour DECIMAL(10, 2) DEFAULT 30.00,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    UNIQUE(location_id, zone_number)
+);
+
+CREATE TABLE IF NOT EXISTS profiles (
+    id UUID REFERENCES auth.users(id) ON DELETE CASCADE PRIMARY KEY,
+    email VARCHAR(255),
+    full_name VARCHAR(255),
+    phone VARCHAR(20),
+    avatar_url TEXT,
+    user_role VARCHAR(20) CHECK (user_role IN ('user', 'location_owner', 'super_admin')) DEFAULT 'user',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS owner_applications (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+    contact_person VARCHAR(255) NOT NULL,
+    phone VARCHAR(20) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    justification TEXT NOT NULL,
+    status VARCHAR(20) CHECK (status IN ('pending', 'approved', 'rejected')) DEFAULT 'pending',
+    reviewed_by UUID REFERENCES auth.users(id),
+    reviewed_at TIMESTAMP WITH TIME ZONE,
+    admin_notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+);
+
+-- =============================================
+-- ENABLE RLS
+-- =============================================
+
+ALTER TABLE parking_locations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE parking_zones ENABLE ROW LEVEL SECURITY;
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE owner_applications ENABLE ROW LEVEL SECURITY;
+
+-- =============================================
+-- RLS POLICIES
+-- =============================================
+
+-- parking_locations
+CREATE POLICY "Locations are viewable by everyone"
+ON parking_locations FOR SELECT USING (true);
+
+CREATE POLICY "Only location owners can create locations"
+ON parking_locations FOR INSERT WITH CHECK (auth.uid() = owner_user_id);
+
+CREATE POLICY "Location owners and super admins can update locations"
+ON parking_locations FOR UPDATE USING (
+    auth.uid() = owner_user_id OR
+    auth.uid() IN (SELECT id FROM profiles WHERE user_role = 'super_admin')
+);
+
+CREATE POLICY "Location owners and super admins can delete locations"
+ON parking_locations FOR DELETE USING (
+    auth.uid() = owner_user_id OR
+    auth.uid() IN (SELECT id FROM profiles WHERE user_role = 'super_admin')
+);
+
+-- parking_zones
+CREATE POLICY "Zones are viewable by everyone"
+ON parking_zones FOR SELECT USING (true);
+
+CREATE POLICY "Only location owners can insert zones"
+ON parking_zones FOR INSERT WITH CHECK (
+    EXISTS (
+        SELECT 1 FROM parking_locations 
+        WHERE parking_locations.id = parking_zones.location_id
+        AND parking_locations.owner_user_id = auth.uid()
+    ) OR auth.uid() IN (SELECT id FROM profiles WHERE user_role = 'super_admin')
+);
+
+CREATE POLICY "Location owners and super admins can update zones"
+ON parking_zones FOR UPDATE USING (
+    EXISTS (
+        SELECT 1 FROM parking_locations 
+        WHERE parking_locations.id = parking_zones.location_id
+        AND parking_locations.owner_user_id = auth.uid()
+    ) OR auth.uid() IN (SELECT id FROM profiles WHERE user_role = 'super_admin')
+);
+
+CREATE POLICY "Location owners and super admins can delete zones"
+ON parking_zones FOR DELETE USING (
+    EXISTS (
+        SELECT 1 FROM parking_locations 
+        WHERE parking_locations.id = parking_zones.location_id
+        AND parking_locations.owner_user_id = auth.uid()
+    ) OR auth.uid() IN (SELECT id FROM profiles WHERE user_role = 'super_admin')
+);
+
+-- profiles
+CREATE POLICY "Users can view all profiles"
+ON profiles FOR SELECT USING (true);
+
+CREATE POLICY "Users can insert their own profile"
+ON profiles FOR INSERT WITH CHECK (auth.uid() = id);
+
+CREATE POLICY "Users can update their own profile"
+ON profiles FOR UPDATE USING (auth.uid() = id);
+
+CREATE POLICY "Super admins can update any profile"
+ON profiles FOR UPDATE USING (
+    auth.uid() IN (SELECT id FROM profiles WHERE user_role = 'super_admin')
+);
+
+-- owner_applications
+CREATE POLICY "Users can view their own applications"
+ON owner_applications FOR SELECT USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can create their own applications"
+ON owner_applications FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Users can update pending applications"
+ON owner_applications FOR UPDATE USING (
+    auth.uid() = user_id AND status = 'pending'
+);
+
+CREATE POLICY "Super admins can view all applications"
+ON owner_applications FOR SELECT USING (
+    auth.uid() IN (SELECT id FROM profiles WHERE user_role = 'super_admin')
+);
+
+CREATE POLICY "Super admins can update applications"
+ON owner_applications FOR UPDATE USING (
+    auth.uid() IN (SELECT id FROM profiles WHERE user_role = 'super_admin')
+);
+
+-- =============================================
+-- FUNCTIONS
+-- =============================================
+
+CREATE OR REPLACE FUNCTION process_owner_application(
+    application_id UUID,
+    approve BOOLEAN,
+    admin_notes TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    applicant_user_id UUID;
+    reviewer_id UUID;
+BEGIN
+    reviewer_id := auth.uid();
+
+    IF NOT EXISTS (
+        SELECT 1 FROM profiles
+        WHERE id = reviewer_id AND user_role = 'super_admin'
+    ) THEN
+        RAISE EXCEPTION 'Unauthorized: Only super admins can process applications';
+    END IF;
+
+    SELECT user_id INTO applicant_user_id
+    FROM owner_applications
+    WHERE id = application_id AND status = 'pending';
+
+    IF applicant_user_id IS NULL THEN
+        RAISE EXCEPTION 'Application not found or already processed';
+    END IF;
+
+    UPDATE owner_applications
+    SET status = CASE WHEN approve THEN 'approved' ELSE 'rejected' END,
+        reviewed_by = reviewer_id,
+        reviewed_at = NOW(),
+        admin_notes = admin_notes,
+        updated_at = NOW()
+    WHERE id = application_id;
+
+    IF approve THEN
+        UPDATE profiles
+        SET user_role = 'location_owner', updated_at = NOW()
+        WHERE id = applicant_user_id;
+    END IF;
+
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION update_zone_status(zone_id UUID, new_available_slots INTEGER)
+RETURNS BOOLEAN AS $$
+BEGIN
+    UPDATE parking_zones
+    SET available_slots = new_available_slots,
+        is_full = (new_available_slots = 0),
+        status = CASE WHEN new_available_slots = 0 THEN 'full' ELSE 'available' END,
+        updated_at = NOW()
+    WHERE id = zone_id;
+
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- =============================================
+-- INDEXES
+-- =============================================
+
+CREATE INDEX IF NOT EXISTS idx_parking_locations_owner ON parking_locations(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_parking_zones_location ON parking_zones(location_id);
+CREATE INDEX IF NOT EXISTS idx_parking_zones_status ON parking_zones(status);
+CREATE INDEX IF NOT EXISTS idx_owner_applications_status ON owner_applications(status);
+CREATE INDEX IF NOT EXISTS idx_owner_applications_user_id ON owner_applications(user_id);
+CREATE INDEX IF NOT EXISTS idx_profiles_user_role ON profiles(user_role);
+
+-- =============================================
+-- AUTO PROFILE CREATION ON SIGNUP
+-- =============================================
+
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger AS $$
+BEGIN
+    INSERT INTO public.profiles (id, email, full_name, user_role)
+    VALUES (NEW.id, NEW.email, NEW.raw_user_meta_data->>'full_name', 'user');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+
+CREATE TRIGGER on_auth_user_created
+AFTER INSERT ON auth.users
+FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+
+
+
+code for insertion 
+INSERT INTO parking_locations (name, address, lat, lng, owner_user_id, description)
+VALUES
+('CMRIT Campus', 'CMR Institute of Technology, Bangalore', 12.934533, 77.610969, 'YOUR_USER_ID_HERE', 'Main campus parking facility'),
+('Electronic City', 'Electronic City Phase 1, Bangalore', 12.845681, 77.663803, 'YOUR_USER_ID_HERE', 'Commercial area parking'),
+('Koramangala Hub', 'Koramangala 4th Block, Bangalore', 12.935242, 77.626579, 'YOUR_USER_ID_HERE', 'Business district parking');
+
+INSERT INTO parking_zones (location_id, name, zone_number, lat, lng, total_slots, available_slots, is_full, status)
+VALUES
+((SELECT id FROM parking_locations WHERE name='CMRIT Campus'), 'Zone 1', 1, 12.934633, 77.611069, 50, 45, false, 'available'),
+((SELECT id FROM parking_locations WHERE name='CMRIT Campus'), 'Zone 2', 2, 12.934433, 77.610869, 40, 0, true, 'full'),
+((SELECT id FROM parking_locations WHERE name='CMRIT Campus'), 'Zone 3', 3, 12.934733, 77.611269, 60, 30, false, 'available'),
+
+((SELECT id FROM parking_locations WHERE name='Electronic City'), 'Zone 1', 1, 12.845781, 77.663903, 80, 65, false, 'available'),
+((SELECT id FROM parking_locations WHERE name='Electronic City'), 'Zone 2', 2, 12.845581, 77.663703, 70, 40, false, 'available'),
+((SELECT id FROM parking_locations WHERE name='Electronic City'), 'Zone 3', 3, 12.845981, 77.664103, 90, 75, false, 'available'),
+
+((SELECT id FROM parking_locations WHERE name='Koramangala Hub'), 'Zone 1', 1, 12.935342, 77.626679, 45, 25, false, 'available'),
+((SELECT id FROM parking_locations WHERE name='Koramangala Hub'), 'Zone 2', 2, 12.935142, 77.626479, 55, 35, false, 'available'),
+((SELECT id FROM parking_locations WHERE name='Koramangala Hub'), 'Zone 3', 3, 12.935542, 77.626879, 40, 15, false, 'available');
+
+UPDATE parking_locations
+SET total_zones = (
+    SELECT COUNT(*)
+    FROM parking_zones
+    WHERE parking_zones.location_id = parking_locations.id
+);
