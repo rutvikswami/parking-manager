@@ -21,6 +21,7 @@ export function OwnerApplicationButton() {
   const { user } = useAuth()
   const [application, setApplication] = useState<OwnerApplication | null>(null)
   const [loading, setLoading] = useState(false)
+  const [userRole, setUserRole] = useState<string | null>(null)
   const [form, setForm] = useState({
     contact_person: '',
     phone: '',
@@ -31,9 +32,27 @@ export function OwnerApplicationButton() {
 
   useEffect(() => {
     if (user) {
+      checkUserRole()
       checkExistingApplication()
     }
   }, [user])
+
+  const checkUserRole = async () => {
+    if (!user) return
+
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('user_role')
+        .eq('id', user.id)
+        .single()
+
+      if (error) throw error
+      setUserRole(data?.user_role || null)
+    } catch (error) {
+      setUserRole(null)
+    }
+  }
 
   const checkExistingApplication = async () => {
     if (!user) return
@@ -100,6 +119,11 @@ export function OwnerApplicationButton() {
   }
 
   if (!user) return null
+
+  // Hide button for super_admin and location_owner users
+  if (userRole === 'super_admin' || userRole === 'location_owner') {
+    return null
+  }
 
   if (application) {
     const getStatusText = () => {
