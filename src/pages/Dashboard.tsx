@@ -42,6 +42,7 @@ const setUserReservations = (_: any) => {};
     totalSlots: 0,
     availableSlots: 0,
   });
+  const isSuperAdmin = user?.user_metadata?.role === "super_admin";
 
   // Fetch locations
   useEffect(() => {
@@ -193,6 +194,7 @@ const setUserReservations = (_: any) => {};
       </motion.div>
 
       {/* Become Owner CTA */}
+      {!isSuperAdmin && (
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -200,6 +202,7 @@ const setUserReservations = (_: any) => {};
       >
         <OwnerApplicationButton />
       </motion.div>
+      )}
 
       {/* Location Selector */}
       <motion.div
